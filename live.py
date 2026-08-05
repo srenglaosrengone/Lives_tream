@@ -13,69 +13,20 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template_string
 import imageio_ffmpeg
 
-# ផ្ទុកការកំណត់ចេញពី .env
+# Load environment variables
 load_dotenv()
 
-# ការកំណត់ Server និង Hardware
-CPU_MODEL = os.environ.get("CPU_MODEL", "AMD Ryzen 9 7950X3D")
-MEMORY_LIMIT_BYTES = int(os.environ.get("MEMORY_LIMIT_MB", "2560")) * 1024 * 1024
-
-# ប្រើ Lock ដើម្បីការពារការជាន់គ្នានៃទិន្នន័យរវាង Flask និង Streaming Thread
+# Global status lock
 status_lock = threading.Lock()
 
-def _read_cgroup_value(*paths):
-    for path in paths:
-        try:
-            value = Path(path).read_text().strip()
-            if value and value != "max":
-                return int(value)
-        except (OSError, ValueError):
-            continue
-    return None
-
-def system_metrics():
-    """គណនាការប្រើប្រាស់ធនធានប្រព័ន្ធ (CPU/RAM)"""
-    memory_used = _read_cgroup_value(
-        "/sys/fs/cgroup/memory.current",
-        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
-    )
-    memory_limit = _read_cgroup_value(
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ) or MEMORY_LIMIT_BYTES
-
-    if memory_limit <= 0 or memory_limit > 1024 ** 5:
-        memory_limit = MEMORY_LIMIT_BYTES
-    if memory_used is None:
-        memory_used = psutil.Process().memory_info().rss
-
-    cpu_percent = psutil.cpu_percent(interval=None)
-    process = psutil.Process()
-
-    return {
-        "cpu": round(cpu_percent, 1),
-        "cpu_model": CPU_MODEL,
-        "cpu_cores": psutil.cpu_count() or 1,
-        "process_cpu": round(process.cpu_percent(interval=None), 1),
-        "ram": round(min(memory_used / memory_limit * 100, 100), 1),
-        "memory_used_mb": round(memory_used / 1024 / 1024, 1),
-        "memory_limit_mb": round(memory_limit / 1024 / 1024, 1),
-        "process_memory_mb": round(process.memory_info().rss / 1024 / 1024, 1),
-    }
-
-# ការកំណត់ការឡាយ
-VIDEO_FILE = os.environ.get("VIDEO_FILE", "video.mp4")
-PLATFORM   = os.environ.get("PLATFORM", "facebook").lower()
-STREAM_KEY = os.environ.get("STREAM_KEY")
-PORT       = int(os.environ.get("PORT", 10000))
-
+# Initial stream status
 stream_status = {
     "status":        "starting",
-    "start_time":    datetime.now(),
+    "start_time":    None,
     "restart_count": 0,
     "last_error":    None,
-    "platform":      PLATFORM,
-    "video_file":    VIDEO_FILE,
+    "platform":      "unknown",
+    "video_file":    "unknown",
     "fps":           0.0,
     "speed":         "0.0x",
     "bitrate":       "0 kb/s",
@@ -89,20 +40,93 @@ stream_status = {
     "audio_codec":      "—",
     "audio_sample_rate":"—",
     "audio_channels":   "—",
-    "audio_src_bitrate_kbps": 0,
+    "audio_src_bitrate_kbps": 128, # Default fallback
 }
+
+def get_config(key, default=None):
+    """Helper to get config from environment, allowing dynamic updates on restart"""
+    return os.environ.get(key, default)
+
+def parse_bitrate_to_int(bitrate_str):
+    """Convert bitrate string (e.g., '4500k', '4M') to integer kbps"""
+    if not bitrate_str:
+        return 0
+    bitrate_str = str(bitrate_str).lower().strip()
+    match = re.match(r"(\d+)\s*([km]?)", bitrate_str)
+    if not match:
+        return 0
+    val, unit = match.groups()
+    val = int(val)
+    if unit == 'm':
+        return val * 1024
+    return val
+
+def _read_cgroup_value(*paths):
+    for path in paths:
+        try:
+            if os.path.exists(path):
+                value = Path(path).read_text().strip()
+                if value and value != "max":
+                    return int(value)
+        except (OSError, ValueError):
+            continue
+    return None
+
+def system_metrics():
+    """Calculate system resource usage (CPU/RAM)"""
+    cpu_model = get_config("CPU_MODEL", "AMD Ryzen 9 7950X3D")
+    memory_limit_mb = int(get_config("MEMORY_LIMIT_MB", "2560"))
+    memory_limit_bytes = memory_limit_mb * 1024 * 1024
+
+    memory_used = _read_cgroup_value(
+        "/sys/fs/cgroup/memory.current",
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+    )
+    
+    memory_max = _read_cgroup_value(
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    )
+
+    if memory_max and memory_max > 0 and memory_max < 1024 ** 5:
+        memory_limit = memory_max
+    else:
+        memory_limit = memory_limit_bytes
+
+    if memory_used is None:
+        memory_used = psutil.Process().memory_info().rss
+    
+    cpu_percent = psutil.cpu_percent(interval=None)
+    process = psutil.Process()
+
+    return {
+        "cpu": round(cpu_percent, 1),
+        "cpu_model": cpu_model,
+        "cpu_cores": psutil.cpu_count() or 1,
+        "process_cpu": round(process.cpu_percent(interval=None), 1),
+        "ram": round(min(memory_used / memory_limit * 100, 100), 1) if memory_limit > 0 else 0,
+        "memory_used_mb": round(memory_used / 1024 / 1024, 1),
+        "memory_limit_mb": round(memory_limit / 1024 / 1024, 1),
+        "process_memory_mb": round(process.memory_info().rss / 1024 / 1024, 1),
+    }
 
 app = Flask(__name__)
 
-def probe_video():
-    """ពិនិត្យព័ត៌មានបច្ចេកទេសរបស់វីដេអូ"""
+def probe_video(video_file):
+    """Inspect technical information of the video file"""
     ffprobe = shutil.which("ffprobe") or "ffprobe"
+    if not os.path.exists(video_file):
+        return
+    
     try:
         result = subprocess.run(
             [ffprobe, "-v", "quiet", "-print_format", "json",
-             "-show_streams", VIDEO_FILE],
+             "-show_streams", video_file],
             capture_output=True, text=True, timeout=10
         )
+        if result.returncode != 0:
+            return
+
         info = json.loads(result.stdout)
         with status_lock:
             for s in info.get("streams", []):
@@ -111,8 +135,11 @@ def probe_video():
                     stream_status["video_codec"]      = s.get("codec_name", "—").upper()
                     rfr = s.get("r_frame_rate", "0/1")
                     try:
-                        num, den = map(int, rfr.split("/"))
-                        fps_val = round(num / den, 2) if den else 0
+                        if "/" in rfr:
+                            num, den = map(int, rfr.split("/"))
+                            fps_val = round(num / den, 2) if den else 0
+                        else:
+                            fps_val = float(rfr)
                     except Exception:
                         fps_val = 0
                     stream_status["video_fps_src"] = f"{fps_val} fps"
@@ -122,7 +149,8 @@ def probe_video():
                     ch = s.get("channels", 0)
                     stream_status["audio_channels"]    = "Stereo" if ch == 2 else ("Mono" if ch == 1 else str(ch))
                     br = int(s.get("bit_rate", 0))
-                    stream_status["audio_src_bitrate_kbps"] = round(br / 1000)
+                    if br > 0:
+                        stream_status["audio_src_bitrate_kbps"] = round(br / 1000)
         print(f"Probed: {stream_status['video_resolution']} | {stream_status['video_codec']}")
     except Exception as e:
         print(f"ffprobe error: {e}")
@@ -131,43 +159,52 @@ def get_ffmpeg_exe():
     return shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe()
 
 def get_ffmpeg_command():
+    video_file = get_config("VIDEO_FILE", "video.mp4")
+    platform   = get_config("PLATFORM", "facebook").lower()
+    stream_key = get_config("STREAM_KEY")
+    
     rtmp_url = (
-        f"rtmps://live-api-s.facebook.com:443/rtmp/{STREAM_KEY}"
-        if PLATFORM != "youtube"
-        else f"rtmp://a.rtmp.youtube.com/live2/{STREAM_KEY}"
+        f"rtmps://live-api-s.facebook.com:443/rtmp/{stream_key}"
+        if platform != "youtube"
+        else f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
     )
+    
     cpu_cores     = os.cpu_count() or 2
-    video_bitrate = os.environ.get("VIDEO_BITRATE",  "4500k")
-    audio_bitrate = os.environ.get("AUDIO_BITRATE",  "192k")
-    preset        = os.environ.get("FFMPEG_PRESET",  "ultrafast")
-    fps           = os.environ.get("STREAM_FPS",     "30")
-    out_w         = os.environ.get("OUTPUT_WIDTH",   "1080")
-    out_h         = os.environ.get("OUTPUT_HEIGHT",  "1920")
+    video_bitrate = get_config("VIDEO_BITRATE",  "4500k")
+    audio_bitrate = get_config("AUDIO_BITRATE",  "192k")
+    preset        = get_config("FFMPEG_PRESET",  "ultrafast")
+    fps           = get_config("STREAM_FPS",     "30")
+    out_w         = get_config("OUTPUT_WIDTH",   "1080")
+    out_h         = get_config("OUTPUT_HEIGHT",  "1920")
+    
     try:
         gop = int(float(fps)) * 2
     except ValueError:
         gop = 60
 
+    v_bitrate_kbps = parse_bitrate_to_int(video_bitrate)
+    buf_size = f"{v_bitrate_kbps * 2}k" if v_bitrate_kbps > 0 else "9000k"
+
     return [
         get_ffmpeg_exe(),
-        "-re", "-stream_loop", "-1", "-i", VIDEO_FILE,
-        # Scale to 1080×1920 (YouTube Shorts, 9:16) — preserve aspect ratio, pad with black
+        "-re", "-stream_loop", "-1", "-i", video_file,
+        # Scale and pad to target resolution (9:16 default)
         "-vf", f"scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:flags=fast_bilinear,pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1",
-        # Video: H.264 High Profile, all cores
+        # Video encoding
         "-c:v", "libx264",
         "-preset", preset,
         "-profile:v", "high", "-level", "4.1",
         "-b:v", video_bitrate,
         "-maxrate", video_bitrate,
-        "-bufsize", str(int(video_bitrate.rstrip("k")) * 2) + "k",
+        "-bufsize", buf_size,
         "-r", fps,
-        "-g", str(gop),         # keyframe every 2 s (YouTube requirement)
+        "-g", str(gop),
         "-keyint_min", str(gop),
         "-sc_threshold", "0",
         "-threads", str(cpu_cores),
-        # Audio: AAC 192 kbps stereo
+        # Audio encoding
         "-c:a", "aac", "-b:a", audio_bitrate, "-ar", "44100", "-ac", "2",
-        # Output
+        # Output options
         "-tls_verify", "0", "-rtmp_live", "live",
         "-f", "flv",
         "-progress", "pipe:2",
@@ -179,12 +216,13 @@ def get_ffmpeg_command():
 _prog_buf = {}
 
 def parse_progress_line(line):
-    """បកស្រាយទិន្នន័យ Progress ចេញពី FFmpeg"""
+    """Parse FFmpeg progress data"""
     global _prog_buf
     if "=" not in line:
         return
     key, _, val = line.partition("=")
-    key = key.strip(); val = val.strip()
+    key = key.strip()
+    val = val.strip()
     _prog_buf[key] = val
 
     if key != "progress":
@@ -195,8 +233,8 @@ def parse_progress_line(line):
 
     with status_lock:
         try:
-            fps = float(buf.get("fps", 0))
-            stream_status["fps"] = round(fps, 1)
+            fps_val = float(buf.get("fps", 0))
+            stream_status["fps"] = round(fps_val, 1)
         except ValueError: pass
 
         spd = buf.get("speed", "")
@@ -229,8 +267,7 @@ def api_status():
             **stream_status,
             **metrics,
             "restarts":    stream_status["restart_count"],
-            "preset":      os.environ.get("FFMPEG_PRESET", "ultrafast"),
-            "scaling_algo":os.environ.get("SCALING_ALGO", "bilinear"),
+            "preset":      get_config("FFMPEG_PRESET", "ultrafast"),
             "start_time":  stream_status["start_time"].isoformat() if stream_status["start_time"] else None,
         }
     return jsonify(response)
@@ -239,7 +276,6 @@ def api_status():
 def dashboard():
     return render_template_string(DASHBOARD_HTML)
 
-# Dashboard HTML (ដូចដើម ប៉ុន្តែធានាថាវាបង្ហាញទិន្នន័យបានត្រឹមត្រូវ)
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -312,7 +348,7 @@ body {
 <script>
 function update() {
   fetch('/api/status').then(r=>r.json()).then(d=>{
-    document.getElementById('m-status').textContent = d.status.toUpperCase();
+    document.getElementById('m-status').textContent = (d.status || 'unknown').toUpperCase();
     document.getElementById('m-fps').textContent = d.fps;
     document.getElementById('m-bitrate').textContent = d.bitrate;
     document.getElementById('m-speed').textContent = d.speed;
@@ -333,27 +369,35 @@ update();
 </html>"""
 
 def streaming_loop():
-    """Loop ឡាយ ២៤/៧ ជាមួយនឹងការអានទិន្នន័យមានប្រសិទ្ធភាព"""
+    """Main streaming loop with auto-restart"""
     while True:
-        # ឆែកមើលឯកសារវីដេអូ
-        if not os.path.exists(VIDEO_FILE):
+        # Reload environment variables to allow dynamic updates
+        load_dotenv(override=True)
+        
+        video_file = get_config("VIDEO_FILE", "video.mp4")
+        stream_key = get_config("STREAM_KEY")
+        platform   = get_config("PLATFORM", "facebook").lower()
+
+        # Validate video file
+        if not os.path.exists(video_file):
             with status_lock:
-                stream_status.update({"status": "error", "last_error": f"Video file not found: {VIDEO_FILE}"})
-            print(f"Error: {VIDEO_FILE} not found. Retrying in 10s...")
+                stream_status.update({"status": "error", "last_error": f"Video file not found: {video_file}"})
+            print(f"Error: {video_file} not found. Retrying in 10s...")
             time.sleep(10)
             continue
 
-        if not STREAM_KEY:
+        # Validate stream key
+        if not stream_key:
             with status_lock:
                 stream_status.update({"status": "error", "last_error": "Missing STREAM_KEY"})
             print("Error: STREAM_KEY is missing. Retrying in 10s...")
             time.sleep(10)
             continue
 
-        probe_video()
-        print(f"Starting stream to {PLATFORM.upper()}...")
-
-        load_dotenv(override=True)
+        # Probe video before starting
+        probe_video(video_file)
+        
+        print(f"Starting stream to {platform.upper()}...")
         cmd = get_ffmpeg_command()
 
         try:
@@ -361,12 +405,13 @@ def streaming_loop():
                 stream_status.update({
                     "status": "streaming", 
                     "start_time": datetime.now(),
-                    "last_error": None, 
-                    "frame_count": 0, 
-                    "fps": 0.0
+                    "last_error": None,
+                    "fps": 0.0,
+                    "platform": platform,
+                    "video_file": video_file
                 })
 
-            # បើក FFmpeg Process
+            # Start FFmpeg process
             proc = subprocess.Popen(
                 cmd, 
                 stdout=subprocess.DEVNULL,
@@ -376,12 +421,12 @@ def streaming_loop():
                 universal_newlines=True
             )
 
-            # អាន Progress ម្តងមួយបន្ទាត់ (ប្រសិទ្ធភាពខ្ពស់)
+            # Read stderr line by line for progress/errors
             for line in proc.stderr:
                 line = line.strip()
                 if line:
                     parse_progress_line(line)
-                    if "=" not in line: # បង្ហាញតែកំហុសពិតប្រាកដក្នុង Console
+                    if "=" not in line:
                         print(f"FFmpeg: {line}")
 
             proc.wait()
@@ -403,7 +448,9 @@ def streaming_loop():
         time.sleep(5)
 
 if __name__ == "__main__":
-    # ចាប់ផ្តើម Thread សម្រាប់ការឡាយ
+    port = int(get_config("PORT", 10000))
+    # Start streaming thread
     threading.Thread(target=streaming_loop, daemon=True).start()
-    # ចាប់ផ្តើម Flask Web Server
-    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+    # Start Flask server
+    print(f"Starting monitor dashboard on port {port}...")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
