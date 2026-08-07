@@ -2,4 +2,5 @@ python-dotenv
 imageio-ffmpeg
 flask
 psutil
+requests
 gunicorn

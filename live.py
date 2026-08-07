@@ -1,4 +1,4 @@
-# live.py - Optimized for 24/7 Streaming with Video Download & Facebook API
+# live.py - Professional 24/7 Streaming Engine with Facebook API Integration
 import subprocess
 import os
 import time
@@ -8,298 +8,411 @@ import threading
 import psutil
 import shutil
 import requests
+import logging
+import signal
+import sys
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template_string
 import imageio_ffmpeg
 
+# Configure Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
+
 # Load environment variables
 load_dotenv()
 
-# Global status lock
-status_lock = threading.Lock()
+class StreamManager:
+    def __init__(self):
+        self.status = "starting"
+        self.start_time = None
+        self.restart_count = 0
+        self.last_error = None
+        self.download_progress = 0
+        self.video_info = {
+            "resolution": "—",
+            "codec": "—",
+            "fps": "—",
+            "bitrate": "0 kb/s"
+        }
+        self.stream_metrics = {
+            "fps": 0.0,
+            "speed": "0.0x",
+            "total_bitrate": "0 kb/s",
+            "frame_count": 0
+        }
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
 
-# Initial stream status
-stream_status = {
-    "status":        "starting",
-    "start_time":    None,
-    "restart_count": 0,
-    "last_error":    None,
-    "platform":      "facebook",
-    "video_file":    "unknown",
-    "fps":           0.0,
-    "speed":         "0.0x",
-    "bitrate":       "0 kb/s",
-    "video_bitrate": "0 kb/s",
-    "audio_bitrate": "0 kb/s",
-    "frame_count":   0,
-    "uptime":        "00:00:00",
-    "video_resolution": "—",
-    "video_codec":      "—",
-    "video_fps_src":    "—",
-    "audio_codec":      "—",
-    "audio_sample_rate":"—",
-    "audio_channels":   "—",
-    "audio_src_bitrate_kbps": 128,
-}
+    def get_config(self, key, default=None):
+        return os.environ.get(key, default)
 
-def get_config(key, default=None):
-    return os.environ.get(key, default)
+    def update_status(self, **kwargs):
+        with self.lock:
+            for key, value in kwargs.items():
+                if hasattr(self, key):
+                    setattr(self, key, value)
+                elif key in ["fps", "speed", "total_bitrate", "frame_count"]:
+                    self.stream_metrics[key] = value
+                elif key in ["resolution", "codec", "fps_src", "bitrate_src"]:
+                    self.video_info[key] = value
 
-def download_video(url, dest_path):
-    """Download video from a direct link if it doesn't exist or if forced"""
-    try:
-        print(f"Downloading video from: {url}")
-        with requests.get(url, stream=True, timeout=30) as r:
-            r.raise_for_status()
-            with open(dest_path, 'wb') as f:
-                shutil.copyfileobj(r.raw, f)
-        print(f"Download complete: {dest_path}")
-        return True
-    except Exception as e:
-        print(f"Download error: {e}")
-        return False
+    def download_video(self):
+        url = self.get_config("VIDEO_URL")
+        dest = self.get_config("VIDEO_FILE", "video.mp4")
+        if not url:
+            return os.path.exists(dest)
 
-def create_facebook_live_video():
-    """Create a new Live Video via Facebook Graph API and return the RTMP URL"""
-    page_id = get_config("PAGE_ID")
-    access_token = get_config("PAGE_ACCESS_TOKEN")
-    
-    if not page_id or not access_token:
-        print("Error: PAGE_ID or PAGE_ACCESS_TOKEN missing.")
-        return None
+        if os.path.exists(dest) and self.get_config("FORCE_DOWNLOAD", "false").lower() != "true":
+            logger.info(f"Video already exists: {dest}")
+            return True
 
-    url = f"https://graph.facebook.com/v18.0/{page_id}/live_videos"
-    params = {
-        "access_token": access_token,
-        "status": "LIVE_NOW",
-        "title": get_config("STREAM_TITLE", "24/7 Live Stream"),
-        "description": get_config("STREAM_DESCRIPTION", "Continuous live stream"),
-    }
-
-    try:
-        response = requests.post(url, params=params, timeout=15)
-        data = response.json()
-        if "stream_url" in data:
-            print(f"Created Facebook Live: {data.get('id')}")
-            return data["stream_url"]
-        else:
-            print(f"Facebook API Error: {data}")
-            return None
-    except Exception as e:
-        print(f"Facebook API Exception: {e}")
-        return None
-
-def parse_bitrate_to_int(bitrate_str):
-    if not bitrate_str: return 0
-    bitrate_str = str(bitrate_str).lower().strip()
-    match = re.match(r"(\d+)\s*([km]?)", bitrate_str)
-    if not match: return 0
-    val, unit = match.groups()
-    val = int(val)
-    if unit == 'm': return val * 1024
-    return val
-
-def _read_cgroup_value(*paths):
-    for path in paths:
         try:
-            if os.path.exists(path):
-                value = Path(path).read_text().strip()
-                if value and value != "max": return int(value)
-        except: continue
-    return None
+            logger.info(f"Downloading video from {url}...")
+            self.update_status(status="downloading", download_progress=0)
+            response = requests.get(url, stream=True, timeout=30)
+            response.raise_for_status()
+            total_size = int(response.headers.get('content-length', 0))
+            
+            downloaded = 0
+            with open(dest, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total_size > 0:
+                            progress = int((downloaded / total_size) * 100)
+                            if progress != self.download_progress:
+                                self.update_status(download_progress=progress)
+            
+            logger.info(f"Download complete: {dest}")
+            return True
+        except Exception as e:
+            err_msg = f"Download failed: {str(e)}"
+            logger.error(err_msg)
+            self.update_status(status="error", last_error=err_msg)
+            return False
 
-def system_metrics():
-    cpu_model = get_config("CPU_MODEL", "Standard Instance")
-    memory_limit_mb = int(get_config("MEMORY_LIMIT_MB", "2048"))
-    memory_used = _read_cgroup_value("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes")
-    if memory_used is None: memory_used = psutil.Process().memory_info().rss
-    cpu_percent = psutil.cpu_percent(interval=None)
-    return {
-        "cpu": round(cpu_percent, 1),
-        "cpu_model": cpu_model,
-        "ram": round(min(memory_used / (memory_limit_mb * 1024 * 1024) * 100, 100), 1) if memory_limit_mb > 0 else 0,
-        "memory_used_mb": round(memory_used / 1024 / 1024, 1),
-        "memory_limit_mb": memory_limit_mb,
-    }
+    def create_fb_live(self):
+        page_id = self.get_config("PAGE_ID")
+        token = self.get_config("PAGE_ACCESS_TOKEN")
+        if not page_id or not token:
+            logger.warning("Missing PAGE_ID or PAGE_ACCESS_TOKEN. Falling back to manual key.")
+            return None
 
-app = Flask(__name__)
+        url = f"https://graph.facebook.com/v18.0/{page_id}/live_videos"
+        params = {
+            "access_token": token,
+            "status": "LIVE_NOW",
+            "title": self.get_config("STREAM_TITLE", "24/7 Live Stream"),
+            "description": self.get_config("STREAM_DESCRIPTION", "Continuous automated stream"),
+        }
 
-def probe_video(video_file):
-    ffprobe = shutil.which("ffprobe") or "ffprobe"
-    try:
-        result = subprocess.run([ffprobe, "-v", "quiet", "-print_format", "json", "-show_streams", video_file], capture_output=True, text=True, timeout=10)
-        info = json.loads(result.stdout)
-        with status_lock:
+        try:
+            resp = requests.post(url, params=params, timeout=15)
+            data = resp.json()
+            if "stream_url" in data:
+                logger.info(f"Created FB Live Video ID: {data.get('id')}")
+                return data["stream_url"]
+            else:
+                logger.error(f"FB API Error: {data}")
+                return None
+        except Exception as e:
+            logger.error(f"FB API Exception: {e}")
+            return None
+
+    def probe_video(self):
+        video_file = self.get_config("VIDEO_FILE", "video.mp4")
+        ffprobe = shutil.which("ffprobe") or "ffprobe"
+        try:
+            cmd = [ffprobe, "-v", "quiet", "-print_format", "json", "-show_streams", video_file]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            info = json.loads(result.stdout)
             for s in info.get("streams", []):
                 if s.get("codec_type") == "video":
-                    stream_status["video_resolution"] = f"{s.get('width','?')}×{s.get('height','?')}"
-                    stream_status["video_codec"] = s.get("codec_name", "—").upper()
-                    rfr = s.get("r_frame_rate", "0/1")
-                    num, den = map(int, rfr.split("/")) if "/" in rfr else (float(rfr), 1)
-                    stream_status["video_fps_src"] = f"{round(num/den, 2) if den else 0} fps"
+                    res = f"{s.get('width')}x{s.get('height')}"
+                    fps_raw = s.get("r_frame_rate", "30/1")
+                    num, den = map(int, fps_raw.split("/")) if "/" in fps_raw else (float(fps_raw), 1)
+                    fps = round(num/den, 2) if den else 0
+                    self.update_status(resolution=res, codec=s.get("codec_name", "").upper(), fps_src=f"{fps} fps")
                 elif s.get("codec_type") == "audio":
-                    stream_status["audio_codec"] = s.get("codec_name", "—").upper()
-                    stream_status["audio_src_bitrate_kbps"] = round(int(s.get("bit_rate", 0)) / 1000) or 128
-    except: pass
+                    br = int(s.get("bit_rate", 0)) // 1000
+                    self.update_status(bitrate_src=f"{br} kbps")
+        except Exception as e:
+            logger.debug(f"Probe failed: {e}")
 
-def get_ffmpeg_command(rtmp_url, video_file):
-    cpu_cores = os.cpu_count() or 2
-    video_bitrate = get_config("VIDEO_BITRATE", "4500k")
-    audio_bitrate = get_config("AUDIO_BITRATE", "192k")
-    preset = get_config("FFMPEG_PRESET", "ultrafast")
-    fps = get_config("STREAM_FPS", "30")
-    out_w = get_config("OUTPUT_WIDTH", "1080")
-    out_h = get_config("OUTPUT_HEIGHT", "1920")
-    gop = int(float(fps)) * 2
-    buf_size = f"{parse_bitrate_to_int(video_bitrate) * 2}k"
+    def get_ffmpeg_cmd(self, rtmp_url):
+        video_file = self.get_config("VIDEO_FILE", "video.mp4")
+        v_bitrate = self.get_config("VIDEO_BITRATE", "4000k")
+        a_bitrate = self.get_config("AUDIO_BITRATE", "128k")
+        preset = self.get_config("FFMPEG_PRESET", "ultrafast")
+        fps = self.get_config("STREAM_FPS", "30")
+        width = self.get_config("OUTPUT_WIDTH", "1080")
+        height = self.get_config("OUTPUT_HEIGHT", "1920")
+        gop = int(float(fps)) * 2
+        
+        # Parse bitrate for buffer size
+        m = re.match(r"(\d+)", v_bitrate)
+        v_kbps = int(m.group(1)) if m else 4000
+        buf_size = f"{v_kbps * 2}k"
 
-    return [
-        shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe(),
-        "-re", "-stream_loop", "-1", "-i", video_file,
-        "-vf", f"scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:flags=fast_bilinear,pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1",
-        "-c:v", "libx264", "-preset", preset, "-profile:v", "high", "-level", "4.1",
-        "-b:v", video_bitrate, "-maxrate", video_bitrate, "-bufsize", buf_size,
-        "-r", fps, "-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0", "-threads", str(cpu_cores),
-        "-c:a", "aac", "-b:a", audio_bitrate, "-ar", "44100", "-ac", "2",
-        "-tls_verify", "0", "-rtmp_live", "live", "-f", "flv", "-progress", "pipe:2", "-nostats", "-v", "error",
-        rtmp_url
-    ]
+        return [
+            shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe(),
+            "-re", "-stream_loop", "-1", 
+            "-i", video_file,
+            "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1",
+            "-c:v", "libx264", "-preset", preset, "-profile:v", "high", "-level", "4.1",
+            "-b:v", v_bitrate, "-maxrate", v_bitrate, "-bufsize", buf_size,
+            "-pix_fmt", "yuv420p", "-r", str(fps), "-g", str(gop), "-keyint_min", str(gop),
+            "-sc_threshold", "0", "-threads", str(os.cpu_count() or 2),
+            "-c:a", "aac", "-b:a", a_bitrate, "-ar", "44100", "-ac", "2",
+            "-f", "flv", "-progress", "pipe:2", "-v", "error", "-nostats",
+            rtmp_url
+        ]
 
-_prog_buf = {}
+    def parse_progress(self, line):
+        if "=" not in line: return
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        
+        if key == "fps":
+            try: self.update_status(fps=round(float(val), 1))
+            except: pass
+        elif key == "speed":
+            self.update_status(speed=val)
+        elif key == "bitrate":
+            self.update_status(total_bitrate=val)
+        elif key == "frame":
+            try: self.update_status(frame_count=int(val))
+            except: pass
 
-def parse_progress_line(line):
-    global _prog_buf
-    if "=" not in line: return
-    key, _, val = line.partition("=")
-    _prog_buf[key.strip()] = val.strip()
-    if key.strip() != "progress": return
-    buf = _prog_buf
-    _prog_buf = {}
-    with status_lock:
-        try: stream_status["fps"] = round(float(buf.get("fps", 0)), 1)
-        except: pass
-        m = re.search(r"([\d.]+)x", buf.get("speed", ""))
-        if m: stream_status["speed"] = m.group(1) + "x"
-        m = re.search(r"([\d.]+)kbits/s", buf.get("bitrate", ""))
-        if m:
-            total_kbps = float(m.group(1))
-            stream_status["bitrate"] = f"{round(total_kbps)} kb/s"
-            stream_status["video_bitrate"] = f"{round(max(0, total_kbps - stream_status['audio_src_bitrate_kbps']))} kb/s"
-        try: stream_status["frame_count"] = int(buf.get("frame", 0))
-        except: pass
+    def run(self):
+        logger.info("Starting Stream Manager...")
+        while not self.stop_event.is_set():
+            load_dotenv(override=True)
+            
+            # 1. Download Video
+            if not self.download_video():
+                time.sleep(10); continue
+
+            # 2. Prepare RTMP URL
+            rtmp_url = self.create_fb_live()
+            if not rtmp_url:
+                manual_key = self.get_config("STREAM_KEY")
+                if manual_key:
+                    rtmp_url = f"rtmps://live-api-s.facebook.com:443/rtmp/{manual_key}"
+                else:
+                    self.update_status(status="error", last_error="No RTMP URL or Stream Key")
+                    time.sleep(10); continue
+
+            # 3. Start Streaming
+            self.probe_video()
+            cmd = self.get_ffmpeg_cmd(rtmp_url)
+            
+            try:
+                self.update_status(status="streaming", start_time=datetime.now(), last_error=None)
+                logger.info("FFmpeg started.")
+                process = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, bufsize=1, universal_newlines=True)
+                
+                for line in process.stderr:
+                    if self.stop_event.is_set():
+                        process.terminate(); break
+                    self.parse_progress(line.strip())
+                
+                process.wait()
+                if process.returncode != 0 and not self.stop_event.is_set():
+                    logger.error(f"FFmpeg exited with code {process.returncode}")
+                    self.update_status(status="error", last_error=f"FFmpeg Exit Code {process.returncode}")
+            except Exception as e:
+                logger.error(f"Stream Exception: {e}")
+                self.update_status(status="error", last_error=str(e))
+
+            self.update_status(restart_count=self.restart_count + 1)
+            if not self.stop_event.is_set():
+                logger.info("Restarting in 5s...")
+                time.sleep(5)
+
+# Initialize Global Manager
+manager = StreamManager()
+
+# Flask App
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return render_template_string(DASHBOARD_HTML)
 
 @app.route("/api/status")
 def api_status():
-    with status_lock:
-        if stream_status["start_time"]:
-            delta = datetime.now() - stream_status["start_time"]
-            stream_status["uptime"] = str(delta).split(".")[0]
-        metrics = system_metrics()
-        response = {**stream_status, **metrics, "restarts": stream_status["restart_count"]}
-    return jsonify(response)
+    with manager.lock:
+        uptime = "00:00:00"
+        if manager.start_time:
+            delta = datetime.now() - manager.start_time
+            uptime = str(delta).split(".")[0]
+        
+        # System Metrics
+        mem = psutil.virtual_memory()
+        cpu = psutil.cpu_percent()
+        
+        return jsonify({
+            "status": manager.status,
+            "uptime": uptime,
+            "restarts": manager.restart_count,
+            "error": manager.last_error,
+            "download_progress": manager.download_progress,
+            "metrics": manager.stream_metrics,
+            "video": manager.video_info,
+            "system": {
+                "cpu": cpu,
+                "ram": mem.percent
+            }
+        })
 
-@app.route("/")
-def dashboard():
-    return render_template_string(DASHBOARD_HTML)
-
-DASHBOARD_HTML = """<!DOCTYPE html>
+DASHBOARD_HTML = """
+<!DOCTYPE html>
 <html lang="en">
 <head>
-<title>Stream Monitor (Auto-Go-Live)</title>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-:root { --bg: #080810; --card: #13131f; --border: #1c1c2e; --text: #ddddf0; --sub: #5c5c78; --green: #22c55e; --red: #ef4444; }
-body { background: var(--bg); color: var(--text); font-family: sans-serif; padding: 20px; }
-.metrics-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
-.metric-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
-.metric-label { font-size: 10px; color: var(--sub); text-transform: uppercase; margin-bottom: 8px; }
-.metric-val { font-size: 20px; font-weight: 700; }
-.panel { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-top: 20px; }
-.info-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stream Engine V3</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <style>
+        :root { --bg: #0a0a0f; --card: #14141f; --border: #232333; --text: #e1e1e6; --sub: #828291; --green: #00e676; --red: #ff5252; --blue: #40c4ff; }
+        body { background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; margin: 0; padding: 20px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 15px; max-width: 1200px; margin: 0 auto; }
+        .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 20px; transition: 0.3s; }
+        .card:hover { border-color: var(--blue); }
+        .label { color: var(--sub); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; font-weight: 600; }
+        .value { font-size: 24px; font-weight: 800; font-family: 'JetBrains Mono'; }
+        .status-tag { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 700; text-transform: uppercase; }
+        .status-streaming { background: rgba(0, 230, 118, 0.1); color: var(--green); }
+        .status-error { background: rgba(255, 82, 82, 0.1); color: var(--red); }
+        .status-other { background: rgba(64, 196, 255, 0.1); color: var(--blue); }
+        .progress-bar { height: 6px; background: #1e1e2e; border-radius: 3px; overflow: hidden; margin-top: 10px; }
+        .progress-fill { height: 100%; background: var(--blue); transition: 0.5s; }
+        .header { max-width: 1200px; margin: 0 auto 30px; display: flex; justify-content: space-between; align-items: center; }
+        .info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; font-size: 13px; margin-top: 15px; }
+        .info-item { color: var(--sub); }
+        .info-val { color: var(--text); text-align: right; font-weight: 600; }
+    </style>
 </head>
 <body>
-<div class="metrics-row">
-<div class="metric-card"><div class="metric-label">Status</div><div class="metric-val" id="m-status" style="color:var(--green)">Starting</div></div>
-<div class="metric-card"><div class="metric-label">FPS</div><div class="metric-val" id="m-fps">0.0</div></div>
-<div class="metric-card"><div class="metric-label">Bitrate</div><div class="metric-val" id="m-bitrate">0 kb/s</div></div>
-<div class="metric-card"><div class="metric-label">Restarts</div><div class="metric-val" id="i-restarts">0</div></div>
-</div>
-<div class="panel">
-<div class="info-row"><span>Uptime</span><span id="h-uptime">--:--:--</span></div>
-<div class="info-row"><span>CPU Usage</span><span id="i-cpu">--%</span></div>
-<div class="info-row"><span>RAM Usage</span><span id="i-ram">--%</span></div>
-<div class="info-row"><span>Resolution</span><span id="i-res">--</span></div>
-</div>
-<script>
-function update() {
-  fetch('/api/status').then(r=>r.json()).then(d=>{
-    document.getElementById('m-status').textContent = (d.status || 'unknown').toUpperCase();
-    document.getElementById('m-fps').textContent = d.fps;
-    document.getElementById('m-bitrate').textContent = d.bitrate;
-    document.getElementById('h-uptime').textContent = d.uptime;
-    document.getElementById('i-cpu').textContent = d.cpu + '%';
-    document.getElementById('i-ram').textContent = d.ram + '%';
-    document.getElementById('i-res').textContent = d.video_resolution;
-    document.getElementById('i-restarts').textContent = d.restarts;
-  }).catch(()=>{});
-}
-setInterval(update, 2000); update();
-</script>
+    <div class="header">
+        <div style="font-size: 24px; font-weight: 800;">Stream Engine <span style="color: var(--blue);">V3</span></div>
+        <div id="status-badge" class="status-tag">Starting</div>
+    </div>
+    <div class="grid">
+        <div class="card">
+            <div class="label">Uptime</div>
+            <div class="value" id="uptime">00:00:00</div>
+            <div class="info-grid">
+                <div class="info-item">Restarts</div><div class="info-val" id="restarts">0</div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="label">Stream Performance</div>
+            <div class="value" id="fps">0.0 <span style="font-size: 14px; color: var(--sub);">FPS</span></div>
+            <div class="info-grid">
+                <div class="info-item">Bitrate</div><div class="info-val" id="bitrate">0 kb/s</div>
+                <div class="info-item">Speed</div><div class="info-val" id="speed">0.0x</div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="label">System Resources</div>
+            <div class="value" id="cpu">0% <span style="font-size: 14px; color: var(--sub);">CPU</span></div>
+            <div class="info-grid">
+                <div class="info-item">RAM Usage</div><div class="info-val" id="ram">0%</div>
+            </div>
+        </div>
+        <div class="card" id="download-card" style="display: none;">
+            <div class="label">Downloading Video</div>
+            <div class="value" id="dl-percent">0%</div>
+            <div class="progress-bar"><div class="progress-fill" id="dl-fill" style="width: 0%;"></div></div>
+        </div>
+    </div>
+    <div class="grid" style="margin-top: 15px;">
+        <div class="card" style="grid-column: 1 / -1;">
+            <div class="label">Technical Information</div>
+            <div class="info-grid" style="grid-template-columns: repeat(4, 1fr);">
+                <div><div class="info-item">Resolution</div><div class="info-val" id="v-res">—</div></div>
+                <div><div class="info-item">Video Codec</div><div class="info-val" id="v-codec">—</div></div>
+                <div><div class="info-item">Source FPS</div><div class="info-val" id="v-fps">—</div></div>
+                <div><div class="info-item">Audio Source</div><div class="info-val" id="v-audio">—</div></div>
+            </div>
+            <div id="error-box" style="margin-top: 20px; color: var(--red); font-size: 12px; display: none; font-family: 'JetBrains Mono';"></div>
+        </div>
+    </div>
+
+    <script>
+        function update() {
+            fetch('/api/status').then(r => r.json()).then(d => {
+                document.getElementById('uptime').textContent = d.uptime;
+                document.getElementById('restarts').textContent = d.restarts;
+                document.getElementById('fps').childNodes[0].textContent = d.metrics.fps + ' ';
+                document.getElementById('bitrate').textContent = d.metrics.total_bitrate;
+                document.getElementById('speed').textContent = d.metrics.speed;
+                document.getElementById('cpu').childNodes[0].textContent = d.system.cpu + '% ';
+                document.getElementById('ram').textContent = d.system.ram + '%';
+                
+                // Status Badge
+                const badge = document.getElementById('status-badge');
+                badge.textContent = d.status;
+                badge.className = 'status-tag ' + (d.status === 'streaming' ? 'status-streaming' : (d.status === 'error' ? 'status-error' : 'status-other'));
+
+                // Video Info
+                document.getElementById('v-res').textContent = d.video.resolution;
+                document.getElementById('v-codec').textContent = d.video.codec;
+                document.getElementById('v-fps').textContent = d.video.fps_src;
+                document.getElementById('v-audio').textContent = d.video.bitrate_src;
+
+                // Download Progress
+                const dlCard = document.getElementById('download-card');
+                if (d.status === 'downloading') {
+                    dlCard.style.display = 'block';
+                    document.getElementById('dl-percent').textContent = d.download_progress + '%';
+                    document.getElementById('dl-fill').style.width = d.download_progress + '%';
+                } else {
+                    dlCard.style.display = 'none';
+                }
+
+                // Error Box
+                const errBox = document.getElementById('error-box');
+                if (d.error) {
+                    errBox.style.display = 'block';
+                    errBox.textContent = 'LAST ERROR: ' + d.error;
+                } else {
+                    errBox.style.display = 'none';
+                }
+            }).catch(e => console.error(e));
+        }
+        setInterval(update, 2000);
+        update();
+    </script>
 </body>
-</html>"""
+</html>
+"""
 
-def streaming_loop():
-    while True:
-        load_dotenv(override=True)
-        video_url = get_config("VIDEO_URL")
-        video_file = get_config("VIDEO_FILE", "video.mp4")
-        
-        # Download video if URL is provided
-        if video_url:
-            if not os.path.exists(video_file) or get_config("FORCE_DOWNLOAD", "false").lower() == "true":
-                with status_lock: stream_status.update({"status": "downloading", "last_error": None})
-                if not download_video(video_url, video_file):
-                    with status_lock: stream_status.update({"status": "error", "last_error": "Video download failed"})
-                    time.sleep(15); continue
-
-        if not os.path.exists(video_file):
-            with status_lock: stream_status.update({"status": "error", "last_error": f"Video file not found: {video_file}"})
-            time.sleep(10); continue
-
-        print("Creating Facebook Live Stream...")
-        rtmp_url = create_facebook_live_video()
-        
-        if not rtmp_url:
-            stream_key = get_config("STREAM_KEY")
-            if stream_key: rtmp_url = f"rtmps://live-api-s.facebook.com:443/rtmp/{stream_key}"
-            else:
-                with status_lock: stream_status.update({"status": "error", "last_error": "API failed and no STREAM_KEY"})
-                time.sleep(15); continue
-
-        probe_video(video_file)
-        cmd = get_ffmpeg_command(rtmp_url, video_file)
-
-        try:
-            with status_lock: stream_status.update({"status": "streaming", "start_time": datetime.now(), "last_error": None, "fps": 0.0, "video_file": video_file})
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, bufsize=1, universal_newlines=True)
-            for line in proc.stderr:
-                line = line.strip()
-                if line:
-                    parse_progress_line(line)
-                    if "=" not in line: print(f"FFmpeg: {line}")
-            proc.wait()
-        except Exception as e:
-            with status_lock: stream_status.update({"status": "error", "last_error": str(e)})
-            print(f"Exception: {e}")
-
-        with status_lock: stream_status["restart_count"] += 1
-        time.sleep(5)
+def signal_handler(sig, frame):
+    logger.info("Shutdown signal received. Cleaning up...")
+    manager.stop_event.set()
+    sys.exit(0)
 
 if __name__ == "__main__":
-    port = int(get_config("PORT", 10000))
-    threading.Thread(target=streaming_loop, daemon=True).start()
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    port = int(manager.get_config("PORT", 10000))
+    
+    # Start Manager Thread
+    thread = threading.Thread(target=manager.run, daemon=True)
+    thread.start()
+    
+    # Start Flask
+    logger.info(f"Dashboard running on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
